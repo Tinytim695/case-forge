@@ -1,0 +1,822 @@
+#!/usr/bin/env python3
+"""CaseForge: a local-first Linux incident-response case collector."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import platform
+import re
+import shutil
+import socket
+import stat
+import sys
+import time
+import zipfile
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Iterable
+
+SCHEMA = 1
+VERSION = "0.1.0"
+MODULES = ("system", "process", "network", "users", "persistence", "filesystem", "logs")
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def sha256_file(path: Path, limit: int | None = None) -> str | None:
+    try:
+        digest = hashlib.sha256()
+        total = 0
+        with path.open("rb", buffering=0) as handle:
+            while True:
+                chunk = handle.read(1024 * 1024)
+                if not chunk:
+                    break
+                if limit is not None:
+                    remaining = limit - total
+                    if remaining <= 0:
+                        break
+                    chunk = chunk[:remaining]
+                digest.update(chunk)
+                total += len(chunk)
+                if limit is not None and total >= limit:
+                    break
+        return digest.hexdigest()
+    except (OSError, PermissionError):
+        return None
+
+
+def read_text(path: Path, default: str = "") -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except (OSError, PermissionError):
+        return default
+
+
+def readlink(path: Path) -> str | None:
+    try:
+        return os.readlink(path)
+    except (OSError, PermissionError):
+        return None
+
+
+def write_json(path: Path, data: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def load_json(path: Path) -> Any:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        raise SystemExit(f"CaseForge: file not found: {path}") from None
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"CaseForge: invalid JSON: {exc}") from None
+
+
+def require_case(path: str) -> Path:
+    case_dir = Path(path).expanduser().resolve()
+    if not (case_dir / "case.json").is_file():
+        raise SystemExit(f"CaseForge: not a case directory: {case_dir}")
+    (case_dir / "evidence").mkdir(exist_ok=True)
+    return case_dir
+
+
+def host_info() -> dict[str, Any]:
+    return {
+        "hostname": socket.gethostname(),
+        "platform": platform.system(),
+        "kernel": platform.release(),
+        "machine": platform.machine(),
+        "python": platform.python_version(),
+    }
+
+
+def new_case(name: str, output: str | None) -> int:
+    safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("._") or "case"
+    case_dir = Path(output).expanduser() if output else Path.cwd() / safe_name
+    case_dir = case_dir.resolve()
+
+    if case_dir.exists() and any(case_dir.iterdir()):
+        print(f"CaseForge: directory is not empty: {case_dir}", file=sys.stderr)
+        return 2
+
+    case_dir.mkdir(parents=True, exist_ok=True)
+    (case_dir / "evidence").mkdir()
+    (case_dir / "notes").mkdir()
+
+    record = {
+        "schema": SCHEMA,
+        "tool": "CaseForge",
+        "tool_version": VERSION,
+        "case_id": f"CF-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}",
+        "name": name,
+        "created_at": now_iso(),
+        "host": host_info(),
+        "modules_collected": [],
+    }
+    write_json(case_dir / "case.json", record)
+    write_json(case_dir / "manifest.json", {"schema": SCHEMA, "artifacts": []})
+    print(f"CaseForge: created {case_dir}")
+    return 0
+
+
+def file_metadata(path: Path, root: Path | None = None, hash_limit: int = 10 * 1024 * 1024) -> dict[str, Any]:
+    try:
+        st = path.stat()
+    except (OSError, PermissionError):
+        return {"path": str(path), "error": "unreadable"}
+
+    display = str(path)
+    if root:
+        try:
+            display = str(path.resolve().relative_to(root.resolve()))
+        except ValueError:
+            pass
+
+    return {
+        "path": display,
+        "size": st.st_size,
+        "mode": stat.filemode(st.st_mode),
+        "uid": st.st_uid,
+        "gid": st.st_gid,
+        "mtime": datetime.fromtimestamp(st.st_mtime, timezone.utc).isoformat(),
+        "sha256": sha256_file(path, hash_limit) if st.st_size <= hash_limit else None,
+    }
+
+
+def collect_system() -> dict[str, Any]:
+    os_release = {}
+    for line in read_text(Path("/etc/os-release")).splitlines():
+        if "=" in line:
+            key, value = line.split("=", 1)
+            os_release[key] = value.strip().strip('"')
+    uptime = read_text(Path("/proc/uptime")).split()
+    return {
+        "os_release": os_release,
+        "uname": {
+            "sysname": platform.system(),
+            "release": platform.release(),
+            "version": platform.version(),
+            "machine": platform.machine(),
+        },
+        "boot_estimate": (
+            time.time() - float(uptime[0]) if uptime and uptime[0].replace(".", "", 1).isdigit() else None
+        ),
+        "cpu_count": os.cpu_count(),
+    }
+
+
+def process_snapshot(pid: int) -> dict[str, Any] | None:
+    root = Path("/proc") / str(pid)
+    if not root.is_dir():
+        return None
+
+    status: dict[str, str] = {}
+    for line in read_text(root / "status").splitlines():
+        if ":" in line:
+            key, value = line.split(":", 1)
+            if key in {"Name", "State", "PPid", "Uid", "Gid", "Threads"}:
+                status[key] = value.strip()
+
+    try:
+        cmdline = (root / "cmdline").read_bytes().replace(b"\x00", b" ").decode("utf-8", "replace").strip()
+    except (OSError, PermissionError):
+        cmdline = ""
+
+    stat_fields = read_text(root / "stat").split()
+    starttime = stat_fields[21] if len(stat_fields) > 21 else None
+    exe = readlink(root / "exe")
+
+    namespaces = {}
+    try:
+        for entry in (root / "ns").iterdir():
+            target = readlink(entry)
+            if target:
+                namespaces[entry.name] = target
+    except (OSError, PermissionError):
+        pass
+
+    return {
+        "pid": pid,
+        "ppid": status.get("PPid"),
+        "name": status.get("Name"),
+        "state": status.get("State"),
+        "uid": status.get("Uid"),
+        "gid": status.get("Gid"),
+        "threads": status.get("Threads"),
+        "exe": exe,
+        "exe_sha256": sha256_file(root / "exe"),
+        "cmdline": cmdline,
+        "starttime_ticks": starttime,
+        "namespaces": dict(sorted(namespaces.items())),
+    }
+
+
+def collect_processes() -> dict[str, Any]:
+    processes = []
+    for entry in sorted(Path("/proc").iterdir(), key=lambda p: p.name):
+        if not entry.name.isdigit():
+            continue
+        item = process_snapshot(int(entry.name))
+        if item:
+            processes.append(item)
+    events = [
+        {
+            "timestamp": now_iso(),
+            "type": "process_observed",
+            "pid": item["pid"],
+            "name": item["name"],
+            "exe": item["exe"],
+            "cmdline": item["cmdline"],
+        }
+        for item in processes
+    ]
+    return {"count": len(processes), "processes": processes, "events": events}
+
+
+def decode_ipv4(value: str) -> str:
+    try:
+        raw = bytes.fromhex(value[:8])
+        return socket.inet_ntoa(raw[::-1])
+    except (ValueError, OSError):
+        return value
+
+
+def parse_proc_net(path: Path, protocol: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    lines = read_text(path).splitlines()
+    if len(lines) < 2:
+        return [], []
+    sockets = []
+    events = []
+    states = {
+        "01": "ESTABLISHED",
+        "02": "SYN_SENT",
+        "03": "SYN_RECV",
+        "04": "FIN_WAIT1",
+        "05": "FIN_WAIT2",
+        "06": "TIME_WAIT",
+        "07": "CLOSE",
+        "08": "CLOSE_WAIT",
+        "09": "LAST_ACK",
+        "0A": "LISTEN",
+        "0B": "CLOSING",
+    }
+    for line in lines[1:]:
+        fields = line.split()
+        if len(fields) < 4:
+            continue
+        local = fields[1]
+        remote = fields[2]
+        state_code = fields[3]
+        local_host, _, local_port = local.partition(":")
+        remote_host, _, remote_port = remote.partition(":")
+        item = {
+            "protocol": protocol,
+            "local": f"{decode_ipv4(local_host)}:{int(local_port, 16) if local_port else 0}",
+            "remote": f"{decode_ipv4(remote_host)}:{int(remote_port, 16) if remote_port else 0}",
+            "state": states.get(state_code, state_code),
+        }
+        sockets.append(item)
+        events.append(
+            {
+                "timestamp": now_iso(),
+                "type": "network_observed",
+                **item,
+            }
+        )
+    return sockets, events
+
+
+def collect_network() -> dict[str, Any]:
+    sockets = []
+    events = []
+    for path, protocol in (
+        (Path("/proc/net/tcp"), "tcp"),
+        (Path("/proc/net/tcp6"), "tcp6"),
+        (Path("/proc/net/udp"), "udp"),
+        (Path("/proc/net/udp6"), "udp6"),
+    ):
+        items, item_events = parse_proc_net(path, protocol)
+        sockets.extend(items)
+        events.extend(item_events)
+    listening = [s for s in sockets if s["state"] == "LISTEN"]
+    return {
+        "socket_count": len(sockets),
+        "listening_count": len(listening),
+        "listening": listening,
+        "sockets": sockets,
+        "events": events,
+    }
+
+
+def collect_users() -> dict[str, Any]:
+    passwd = []
+    for line in read_text(Path("/etc/passwd")).splitlines():
+        fields = line.split(":")
+        if len(fields) >= 7:
+            passwd.append(
+                {
+                    "name": fields[0],
+                    "uid": fields[2],
+                    "gid": fields[3],
+                    "home": fields[5],
+                    "shell": fields[6],
+                }
+            )
+    groups = []
+    for line in read_text(Path("/etc/group")).splitlines():
+        fields = line.split(":")
+        if len(fields) >= 4:
+            groups.append({"name": fields[0], "gid": fields[2], "members": fields[3].split(",") if fields[3] else []})
+    return {"users": passwd, "groups": groups}
+
+
+def persistence_paths() -> list[Path]:
+    paths = [
+        Path("/etc/crontab"),
+        Path("/etc/cron.d"),
+        Path("/etc/cron.daily"),
+        Path("/etc/cron.hourly"),
+        Path("/etc/cron.weekly"),
+        Path("/etc/cron.monthly"),
+        Path("/etc/systemd/system"),
+        Path("/etc/systemd/user"),
+        Path("/etc/init.d"),
+        Path("/etc/profile"),
+        Path("/etc/bash.bashrc"),
+    ]
+    home = Path.home()
+    paths.extend(
+        [
+            home / ".profile",
+            home / ".bashrc",
+            home / ".zshrc",
+            home / ".config/systemd/user",
+            home / ".ssh/authorized_keys",
+        ]
+    )
+    return paths
+
+
+def collect_persistence() -> dict[str, Any]:
+    items = []
+    for base in persistence_paths():
+        if not base.exists():
+            continue
+        if base.is_file():
+            items.append(file_metadata(base))
+            continue
+        try:
+            for path in sorted(base.rglob("*")):
+                if path.is_file() and not path.is_symlink():
+                    items.append(file_metadata(path))
+        except (OSError, PermissionError):
+            continue
+    unique = {item["path"]: item for item in items}
+    events = [
+        {
+            "timestamp": item.get("mtime", now_iso()),
+            "type": "persistence_artifact",
+            "path": item["path"],
+            "sha256": item.get("sha256"),
+        }
+        for item in unique.values()
+    ]
+    return {"count": len(unique), "items": list(unique.values()), "events": events}
+
+
+def collect_filesystem(paths: list[str], max_files: int, max_age_days: int) -> dict[str, Any]:
+    if not paths:
+        return {
+            "skipped": True,
+            "reason": "No paths supplied. Use --paths with the filesystem module.",
+            "items": [],
+            "events": [],
+        }
+
+    cutoff = time.time() - (max_age_days * 86400)
+    items = []
+    for raw in paths:
+        base = Path(raw).expanduser()
+        if not base.exists():
+            continue
+        walker = [base] if base.is_file() else base.rglob("*")
+        for path in walker:
+            if len(items) >= max_files:
+                break
+            try:
+                st = path.stat()
+            except (OSError, PermissionError):
+                continue
+            if not path.is_file() or st.st_mtime < cutoff:
+                continue
+            items.append(file_metadata(path))
+        if len(items) >= max_files:
+            break
+
+    events = [
+        {
+            "timestamp": item.get("mtime", now_iso()),
+            "type": "filesystem_observed",
+            "path": item["path"],
+            "size": item.get("size"),
+            "sha256": item.get("sha256"),
+        }
+        for item in items
+    ]
+    return {
+        "skipped": False,
+        "paths": paths,
+        "max_files": max_files,
+        "max_age_days": max_age_days,
+        "count": len(items),
+        "items": items,
+        "events": events,
+    }
+
+
+def collect_logs(paths: list[str], lines: int) -> dict[str, Any]:
+    candidates = paths or [
+        "/var/log/auth.log",
+        "/var/log/secure",
+        "/var/log/syslog",
+        "/var/log/messages",
+    ]
+    logs = []
+    for raw in candidates:
+        path = Path(raw).expanduser()
+        if not path.is_file():
+            continue
+        try:
+            content = path.read_text(encoding="utf-8", errors="replace")
+        except (OSError, PermissionError):
+            continue
+        selected = content.splitlines()[-lines:]
+        body = "\n".join(selected) + ("\n" if selected else "")
+        logs.append(
+            {
+                "path": str(path),
+                "line_count": len(selected),
+                "content": body,
+                "sha256": sha256_bytes(body.encode()),
+            }
+        )
+    return {"logs": logs, "lines_requested": lines}
+
+
+def save_artifact(case_dir: Path, manifest: dict[str, Any], category: str, data: Any) -> None:
+    index = len(manifest["artifacts"]) + 1
+    filename = f"{index:04d}_{category}.json"
+    path = case_dir / "evidence" / filename
+    write_json(path, data)
+    raw = path.read_bytes()
+    manifest["artifacts"].append(
+        {
+            "id": index,
+            "category": category,
+            "collected_at": now_iso(),
+            "path": str(path.relative_to(case_dir)),
+            "size": len(raw),
+            "sha256": sha256_bytes(raw),
+        }
+    )
+
+
+def collect_case(case_dir: Path, selected: list[str], paths: list[str], max_files: int, max_age_days: int, log_lines: int) -> int:
+    case = load_json(case_dir / "case.json")
+    manifest = load_json(case_dir / "manifest.json")
+    handlers = {
+        "system": collect_system,
+        "process": collect_processes,
+        "network": collect_network,
+        "users": collect_users,
+        "persistence": collect_persistence,
+        "filesystem": lambda: collect_filesystem(paths, max_files, max_age_days),
+        "logs": lambda: collect_logs(paths, log_lines),
+    }
+
+    for module in selected:
+        if module not in handlers:
+            print(f"CaseForge: unknown module: {module}", file=sys.stderr)
+            return 2
+        data = handlers[module]()
+        save_artifact(case_dir, manifest, module, data)
+        print(f"CaseForge: collected {module}")
+
+    case["modules_collected"] = sorted(set(case.get("modules_collected", [])) | set(selected))
+    case["last_collection_at"] = now_iso()
+    write_json(case_dir / "case.json", case)
+    write_json(case_dir / "manifest.json", manifest)
+    return 0
+
+
+def iter_evidence(case_dir: Path) -> Iterable[tuple[dict[str, Any], Path]]:
+    manifest = load_json(case_dir / "manifest.json")
+    for artifact in manifest.get("artifacts", []):
+        path = case_dir / artifact["path"]
+        if path.is_file():
+            yield artifact, path
+
+
+def build_timeline(case_dir: Path) -> list[dict[str, Any]]:
+    events = []
+    for artifact, path in iter_evidence(case_dir):
+        data = load_json(path)
+        raw_events = data.get("events", []) if isinstance(data, dict) else []
+        for event in raw_events:
+            item = dict(event)
+            item["artifact_id"] = artifact["id"]
+            item["artifact_category"] = artifact["category"]
+            events.append(item)
+        events.append(
+            {
+                "timestamp": artifact["collected_at"],
+                "type": "artifact_collected",
+                "artifact_id": artifact["id"],
+                "artifact_category": artifact["category"],
+            }
+        )
+    events.sort(key=lambda item: item.get("timestamp", ""))
+    return events
+
+
+def command_timeline(case_dir: Path) -> int:
+    timeline = build_timeline(case_dir)
+    write_json(case_dir / "timeline.json", timeline)
+    print(f"CaseForge: timeline events={len(timeline)}")
+    print(f"CaseForge: {case_dir / 'timeline.json'}")
+    return 0
+
+
+IOC_PATTERNS = [
+    ("url", re.compile(r"https?://[^\s<>"]+")),
+    ("email", re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.I)),
+    ("ipv4", re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")),
+    ("sha256", re.compile(r"\b[a-fA-F0-9]{64}\b")),
+    ("domain", re.compile(r"\b(?:[a-z0-9-]+\.)+[a-z]{2,}\b", re.I)),
+]
+
+
+def classify_ioc(value: str) -> str:
+    for kind, pattern in IOC_PATTERNS:
+        if pattern.fullmatch(value):
+            return kind
+    return "text"
+
+
+def load_iocs(path: Path) -> list[str]:
+    values = []
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        value = line.strip()
+        if value and not value.startswith("#"):
+            values.append(value)
+    return sorted(set(values))
+
+
+def command_ioc(case_dir: Path, ioc_file: Path) -> int:
+    if not ioc_file.is_file():
+        print(f"CaseForge: IOC file not found: {ioc_file}", file=sys.stderr)
+        return 2
+
+    iocs = load_iocs(ioc_file)
+    matches = []
+    for artifact, path in iter_evidence(case_dir):
+        try:
+            if path.stat().st_size > 5 * 1024 * 1024:
+                continue
+            text_data = path.read_text(encoding="utf-8", errors="replace")
+        except (OSError, UnicodeError):
+            continue
+        for value in iocs:
+            if value in text_data:
+                matches.append(
+                    {
+                        "ioc": value,
+                        "type": classify_ioc(value),
+                        "artifact_id": artifact["id"],
+                        "artifact_category": artifact["category"],
+                        "artifact_path": artifact["path"],
+                    }
+                )
+    result = {
+        "schema": SCHEMA,
+        "scanned_at": now_iso(),
+        "ioc_source": str(ioc_file),
+        "iocs": iocs,
+        "matches": matches,
+    }
+    write_json(case_dir / "iocs.json", result)
+    print(f"CaseForge: IOCs={len(iocs)} matches={len(matches)}")
+    print(f"CaseForge: {case_dir / 'iocs.json'}")
+    return 0
+
+
+def command_report(case_dir: Path) -> int:
+    case = load_json(case_dir / "case.json")
+    manifest = load_json(case_dir / "manifest.json")
+    timeline = build_timeline(case_dir)
+    ioc_data = load_json(case_dir / "iocs.json") if (case_dir / "iocs.json").is_file() else {"matches": []}
+
+    process_count = None
+    listening = []
+    for artifact, path in iter_evidence(case_dir):
+        if artifact["category"] == "process":
+            process_count = load_json(path).get("count")
+        elif artifact["category"] == "network":
+            listening = load_json(path).get("listening", [])
+
+    lines = [
+        "# CaseForge Report",
+        "",
+        f"**Case:** {case.get('name')}",
+        f"**Case ID:** {case.get('case_id')}",
+        f"**Created:** {case.get('created_at')}",
+        f"**Last collection:** {case.get('last_collection_at', 'not collected')}",
+        "",
+        "## Collection",
+        "",
+        f"- Artifacts: {len(manifest.get('artifacts', []))}",
+        f"- Modules: {', '.join(case.get('modules_collected', [])) or 'none'}",
+        f"- Timeline events: {len(timeline)}",
+        f"- IOC matches: {len(ioc_data.get('matches', []))}",
+    ]
+
+    if process_count is not None:
+        lines.extend(["", "## Processes", "", f"- Processes observed: {process_count}"])
+
+    lines.extend(["", "## Listening sockets", ""])
+    if listening:
+        lines.extend(
+            f"- {item['protocol']} {item['local']} ({item['state']})"
+            for item in listening
+        )
+    else:
+        lines.append("- None observed.")
+
+    lines.extend(["", "## Evidence", ""])
+    lines.extend(
+        f"- {artifact['id']:04d} {artifact['category']} {artifact['sha256']} ({artifact['size']} bytes)"
+        for artifact in manifest.get("artifacts", [])
+    )
+
+    if ioc_data.get("matches"):
+        lines.extend(["", "## IOC matches", ""])
+        lines.extend(
+            f"- {match['type']} {match['ioc']} in {match['artifact_category']} ({match['artifact_path']})"
+            for match in ioc_data["matches"]
+        )
+
+    report_path = case_dir / "report.md"
+    report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print(f"CaseForge: report={report_path}")
+    return 0
+
+
+def command_verify(case_dir: Path) -> int:
+    manifest = load_json(case_dir / "manifest.json")
+    failures = []
+    checked = 0
+    for artifact in manifest.get("artifacts", []):
+        path = case_dir / artifact["path"]
+        if not path.is_file():
+            failures.append(f"missing: {artifact['path']}")
+            continue
+        checked += 1
+        actual = sha256_file(path)
+        if actual != artifact["sha256"]:
+            failures.append(f"hash mismatch: {artifact['path']}")
+    if failures:
+        print("CaseForge: INTEGRITY FAILURE", file=sys.stderr)
+        for failure in failures:
+            print(f"  {failure}", file=sys.stderr)
+        return 1
+    print(f"CaseForge: integrity OK ({checked} artifacts)")
+    return 0
+
+
+def command_export(case_dir: Path, output: str) -> int:
+    if command_verify(case_dir) != 0:
+        return 1
+    destination = Path(output).expanduser().resolve()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+
+    files = [p for p in case_dir.rglob("*") if p.is_file() and p != destination]
+    checksums = [
+        f"{sha256_file(path)}  {path.relative_to(case_dir).as_posix()}"
+        for path in files
+    ]
+    checksum_path = case_dir / "SHA256SUMS"
+    checksum_path.write_text("\n".join(sorted(checksums)) + "\n", encoding="utf-8")
+    files.append(checksum_path)
+
+    with zipfile.ZipFile(destination, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for path in files:
+            archive.write(path, path.relative_to(case_dir))
+
+    print(f"CaseForge: export={destination}")
+    return 0
+
+
+def command_status(case_dir: Path) -> int:
+    case = load_json(case_dir / "case.json")
+    manifest = load_json(case_dir / "manifest.json")
+    print(f"Case: {case.get('name')} [{case.get('case_id')}]")
+    print(f"Host: {case.get('host', {}).get('hostname')}")
+    print(f"Modules: {', '.join(case.get('modules_collected', [])) or 'none'}")
+    print(f"Artifacts: {len(manifest.get('artifacts', []))}")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="caseforge",
+        description="Local-first Linux incident-response case collection and analysis.",
+    )
+    parser.add_argument("--version", action="version", version=f"CaseForge {VERSION}")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    new = sub.add_parser("new", help="create a portable case directory")
+    new.add_argument("name")
+    new.add_argument("-o", "--output")
+
+    collect = sub.add_parser("collect", help="collect selected local evidence")
+    collect.add_argument("case")
+    collect.add_argument(
+        "--modules",
+        default="system,process,network,users,persistence",
+        help="comma-separated modules",
+    )
+    collect.add_argument("--all", action="store_true", help="collect every module")
+    collect.add_argument("--paths", nargs="*", default=[], help="paths for filesystem/log collection")
+    collect.add_argument("--max-files", type=int, default=2000)
+    collect.add_argument("--max-age-days", type=int, default=30)
+    collect.add_argument("--log-lines", type=int, default=200)
+
+    for name, help_text in (
+        ("timeline", "build the case timeline"),
+        ("report", "write a Markdown report"),
+        ("verify", "verify evidence hashes"),
+        ("status", "show case status"),
+    ):
+        command = sub.add_parser(name, help=help_text)
+        command.add_argument("case")
+
+    ioc = sub.add_parser("ioc", help="scan evidence for supplied IOCs")
+    ioc.add_argument("case")
+    ioc.add_argument("ioc_file")
+
+    export = sub.add_parser("export", help="create a portable ZIP export")
+    export.add_argument("case")
+    export.add_argument("-o", "--output", required=True)
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+
+    if args.command == "new":
+        return new_case(args.name, args.output)
+
+    if args.command == "collect":
+        case_dir = require_case(args.case)
+        selected = list(MODULES) if args.all else [x.strip() for x in args.modules.split(",") if x.strip()]
+        return collect_case(
+            case_dir,
+            selected,
+            args.paths,
+            args.max_files,
+            args.max_age_days,
+            args.log_lines,
+        )
+
+    case_dir = require_case(args.case)
+
+    if args.command == "timeline":
+        return command_timeline(case_dir)
+    if args.command == "ioc":
+        return command_ioc(case_dir, Path(args.ioc_file).expanduser())
+    if args.command == "report":
+        return command_report(case_dir)
+    if args.command == "verify":
+        return command_verify(case_dir)
+    if args.command == "export":
+        return command_export(case_dir, args.output)
+    if args.command == "status":
+        return command_status(case_dir)
+
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
