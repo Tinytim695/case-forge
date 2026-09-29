@@ -1,0 +1,27 @@
+name: quality
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: Syntax check
+        run: python -m py_compile caseforge
+      - name: Tests
+        run: |
+          python -m pip install --disable-pip-version-check pytest
+          pytest -q
+      - name: Public hygiene
+        shell: bash
+        run: |
+          if grep -RInE --exclude-dir=.git --exclude='quality.yml' 'BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY|ghp_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9]{20,}|AIza[A-Za-z0-9_-]{20,}|@gmail\\.com|@outlook\\.com|@icloud\\.com' .; then
+            echo "Potential secret or personal-email pattern found"
+            exit 1
+          fi
